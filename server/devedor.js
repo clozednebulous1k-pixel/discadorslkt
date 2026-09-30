@@ -1,10 +1,9 @@
-import crypto from 'node:crypto';
 import { r2, agoraISO } from './cobranca.js';
 
 export const STATUS_FILA = ['ABERTO', 'SEM_CONTATO'];
 export const NUNCA = '2000-01-01 00:00:00';
 
-export const novoId = () => crypto.randomUUID().replace(/-/g, '').slice(0, 12);
+export const novoId = () => String(Math.floor(Math.random() * 9e11) + 1e11);
 
 export const normalizar = (s) => String(s ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
   .toUpperCase().replace(/\s+/g, ' ').trim();
@@ -22,7 +21,8 @@ export function derivar(d) {
   const temTelefone = d.telefones.some((t) => t.status !== 'INVALIDO');
   const naFila = STATUS_FILA.includes(d.status) && temTelefone;
 
-  d.valor_aberto = r2(d.dividas.filter((v) => v.status === 'ABERTA').reduce((s, v) => s + v.valor_original, 0));
+  d.valor_aberto = r2(d.dividas.filter((v) => v.status === 'ABERTA').reduce((s, v) => s + Number(v.valor_original), 0));
+  d.telefone_ids = d.telefones.map((t) => String(t.id));
   d.nome_busca = normalizar(d.nome);
   const termos = new Set(d.telefones.map((t) => t.numero));
   for (const v of d.dividas) if (v.contrato) termos.add(normalizar(v.contrato));
@@ -39,6 +39,33 @@ export function derivar(d) {
   d.agendado = naFila && !!d.operador_id && !!d.proximo_contato && !!d.agendamento_pessoal;
   d.agendado_por = d.agendado ? d.operador_id : null;
   return d;
+}
+
+const ZEROS = { devedores: 0, em_aberto: 0, em_acordo: 0, quitados: 0, virgens: 0, valor_aberto: 0, distribuidos: 0 };
+
+export function contagem(d) {
+  if (!d) return { ...ZEROS };
+  const aberto = STATUS_FILA.includes(d.status);
+  return {
+    devedores: 1,
+    em_aberto: aberto ? 1 : 0,
+    em_acordo: d.status === 'EM_ACORDO' ? 1 : 0,
+    quitados: d.status === 'QUITADO' ? 1 : 0,
+    virgens: aberto && !d.tentativas ? 1 : 0,
+    valor_aberto: d.valor_aberto || 0,
+    distribuidos: aberto && d.operador_id ? 1 : 0,
+  };
+}
+
+export function deltaContagem(antes, depois) {
+  const a = contagem(antes);
+  const b = contagem(depois);
+  const o = {};
+  for (const k of Object.keys(ZEROS)) {
+    const n = r2(b[k] - a[k]);
+    if (n) o[k] = n;
+  }
+  return o;
 }
 
 export function novoDevedor(campos) {

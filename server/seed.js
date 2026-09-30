@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { fs, C, hashSenha, gravarEmLotes } from './firebase.js';
 import { agoraISO } from './cobranca.js';
-import { novoDevedor, novoId, idDevedor } from './devedor.js';
+import { novoDevedor, novoId, idDevedor, contagem } from './devedor.js';
 
 export const CONFIG_PADRAO = {
   empresa_nome: 'Minha Assessoria de Cobrança',
@@ -62,12 +62,12 @@ async function popular() {
   const ops = [];
   for (const [codigo, descricao, tipo, ag, inv, fin] of TABULACOES) {
     ops.push((b) => b.set(C('tabulacoes').doc(novoId()), {
-      codigo, descricao, tipo, exige_agendamento: !!ag, invalida_telefone: !!inv, finaliza: !!fin, ativa: true,
+      codigo, descricao, tipo, exige_agendamento: ag, invalida_telefone: inv, finaliza: fin, ativa: 1,
     }));
   }
   const usuario = (nome, login, senha, perfil, ramal = null) => ops.push((b) => b.set(C('usuarios').doc(novoId()), {
     nome, login, senha_hash: hashSenha(senha), perfil, ramal, ativo: true, carteiras: [],
-    ultimo_acesso: null, atendendo: null, criado_em: agoraISO(),
+    ultimo_acesso: null, atendendo: null, sessao: 0, criado_em: agoraISO(),
   }));
   usuario('Administrador', 'admin', 'admin123', 'admin');
   usuario('Supervisora Demo', 'supervisor', 'super123', 'supervisor');
@@ -79,10 +79,7 @@ async function popular() {
     { id: novoId(), nome: 'Mensalidades - Escola Demo', credor: 'Colégio Demo Ltda', cnpj: '11.111.111/0001-11',
       juros_mes: 1, multa: 2, honorarios: 10, desconto_max: 20, parcelas_max: 6, entrada_min_pct: 20, prefixo: 'MEN', desc: 'Mensalidade escolar' },
   ];
-  for (const { id, prefixo, desc, ...c } of carteiras) {
-    ops.push((b) => b.set(C('carteiras').doc(id), { ...c, ativa: true, criado_em: agoraISO() }));
-  }
-
+  const totais = {};
   for (let i = 0; i < 120; i++) {
     const cart = carteiras[i % 2];
     const [cidade, uf, ddd] = pick(CIDADES);
@@ -110,6 +107,14 @@ async function popular() {
       telefones, dividas,
     });
     ops.push((b) => b.set(C('devedores').doc(idDevedor(cart.id, cpf)), dev));
+    const foto = contagem(dev);
+    totais[cart.id] = totais[cart.id] || {};
+    for (const [k, v] of Object.entries(foto)) totais[cart.id][k] = (totais[cart.id][k] || 0) + v;
+  }
+  for (const { id, prefixo, desc, ...c } of carteiras) {
+    ops.push((b) => b.set(C('carteiras').doc(id), {
+      ...c, ativa: 1, criado_em: agoraISO(), ...(totais[id] || {}),
+    }));
   }
   await gravarEmLotes(ops);
 }
@@ -122,11 +127,10 @@ export function garantirInicializado() {
     inicializacao = (async () => {
       const cfgRef = C('config').doc('geral');
       if ((await cfgRef.get()).exists) return;
-      try {
-        await C('config').doc('_inicializando').create({ em: agoraISO() });
-      } catch {
-        return; // outra instância já está criando os dados
-      }
+      const lock = C('config').doc('_inicializando');
+      const travado = await lock.get();
+      if (travado.exists && Date.now() - new Date(travado.data().em.replace(' ', 'T')).getTime() < 120000) return;
+      await lock.set({ em: agoraISO() });
       await popular();
       await cfgRef.set(CONFIG_PADRAO);
       console.log('Firestore inicializado com dados de demonstração.');

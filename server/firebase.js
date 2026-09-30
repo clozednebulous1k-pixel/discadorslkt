@@ -5,8 +5,10 @@ import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 
 function credenciais() {
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    const j = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    return { projectId: j.project_id, clientEmail: j.client_email, privateKey: j.private_key };
+    let raw = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+    if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) raw = raw.slice(1, -1);
+    const j = JSON.parse(raw);
+    return { projectId: j.project_id, clientEmail: j.client_email, privateKey: String(j.private_key || '').replace(/\\n/g, '\n') };
   }
   const { FIREBASE_PROJECT_ID: projectId, FIREBASE_CLIENT_EMAIL: clientEmail, FIREBASE_PRIVATE_KEY: chave } = process.env;
   if (!projectId || !clientEmail || !chave) {
@@ -16,22 +18,31 @@ function credenciais() {
   return { projectId, clientEmail, privateKey: chave.replace(/\\n/g, '\n') };
 }
 
-const emulador = !!process.env.FIRESTORE_EMULATOR_HOST;
-const cred = emulador ? null : credenciais();
-const app = getApps()[0] || initializeApp(emulador
-  ? { projectId: process.env.FIREBASE_PROJECT_ID || 'demo-virtuanosso' }
-  : { credential: cert(cred) });
+let fsReal = null;
+let segredoReal = null;
 
-export const fs = getFirestore(app);
-if (!globalThis.__firestoreConfigurado) {
-  fs.settings({ ignoreUndefinedProperties: true });
-  globalThis.__firestoreConfigurado = true;
+function iniciar() {
+  if (fsReal) return;
+  const emulador = !!process.env.FIRESTORE_EMULATOR_HOST;
+  const cred = emulador ? null : credenciais();
+  const app = getApps()[0] || initializeApp(emulador
+    ? { projectId: process.env.FIREBASE_PROJECT_ID || 'demo-virtuanosso' }
+    : { credential: cert(cred) });
+  fsReal = getFirestore(app);
+  fsReal.settings({ ignoreUndefinedProperties: true });
+  segredoReal = process.env.SESSION_SECRET
+    || crypto.createHash('sha256').update(cred?.privateKey || 'emulador-local').digest('hex');
 }
+
+export const fs = new Proxy({}, {
+  get(_t, prop) {
+    iniciar();
+    const v = fsReal[prop];
+    return typeof v === 'function' ? v.bind(fsReal) : v;
+  },
+});
 export { FieldValue };
-
-export const SEGREDO = process.env.SESSION_SECRET
-  || crypto.createHash('sha256').update(cred?.privateKey || 'emulador-local').digest('hex');
-
+export const segredo = () => { iniciar(); return segredoReal; };
 export const C = (nome) => fs.collection(nome);
 
 export function hashSenha(senha) {
