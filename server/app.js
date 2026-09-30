@@ -1034,8 +1034,9 @@ async function autenticar(req) {
 }
 
 export async function handle(req, res) {
-  let bruto = req.url || '/';
-  if (!bruto.startsWith('/api/') && Array.isArray(req.query?.path)) bruto = `/api/${req.query.path.join('/')}`;
+  const candidatos = [req.headers['x-forwarded-uri'], req.headers['x-invoke-path'], req.headers['x-vercel-original-url'], req.url];
+  let bruto = candidatos.find((c) => c && String(c).startsWith('/api/') && !String(c).includes('index.js')) || req.url || '/';
+  if (!String(bruto).startsWith('/api/') && Array.isArray(req.query?.path)) bruto = `/api/${req.query.path.join('/')}`;
   const url = new URL(bruto, 'http://localhost');
   if (!url.pathname.startsWith('/api/')) {
     res.writeHead(404);
