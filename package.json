@@ -1,0 +1,17 @@
+{
+  "name": "virtuanosso",
+  "version": "0.1.0",
+  "description": "CRM de cobrança para call center (inspirado no Virtúa Cobrança) - versão de teste",
+  "type": "module",
+  "main": "server/server.js",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --no-warnings server/server.js",
+    "reset": "node --no-warnings server/reset.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^14.5.0"
+  }
+}

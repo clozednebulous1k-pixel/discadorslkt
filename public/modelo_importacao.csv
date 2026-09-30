@@ -1,0 +1,4 @@
+cpf;nome;contrato;descricao;valor;vencimento;telefone1;telefone2;telefone3;email;endereco;cidade;uf;cep;data_nasc
+123.456.789-09;Maria Aparecida Souza;CT000123;Empréstimo pessoal;1.250,90;15/03/2025;(11) 98765-4321;(11) 3456-7890;;maria@email.com;Rua das Flores, 100;São Paulo;SP;01000-000;10/05/1980
+123.456.789-09;Maria Aparecida Souza;CT000124;Cartão de crédito;845,00;10/06/2025;(11) 98765-4321;;;;;;;;
+987.654.321-00;José Carlos Lima;CT000200;Financiamento;5.300,00;01/01/2025;21999998888;;;jose@email.com;Av. Brasil, 2000;Rio de Janeiro;RJ;20000-000;22/11/1975
