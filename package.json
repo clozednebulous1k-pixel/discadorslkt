@@ -3,13 +3,18 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "start": "node server/index.js"
   },
   "dependencies": {
+    "@vercel/functions": "^2.2.12",
     "@whiskeysockets/baileys": "^7.0.0-rc.14",
     "bcryptjs": "^2.4.3",
     "express": "^4.21.2",
+    "firebase-admin": "^13.5.0",
     "pino": "^9.6.0",
     "qrcode": "^1.5.4"
   }

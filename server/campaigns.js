@@ -22,29 +22,25 @@ function shouldPause(message) {
 
 async function work(campaignId) {
   while (true) {
-    const campaign = db.getCampaignRaw(campaignId)
+    const campaign = await db.getCampaignRaw(campaignId)
     if (!campaign || campaign.status !== 'running') return
-    const delivery = db.nextPending(campaignId)
+    const delivery = await db.nextPending(campaignId)
     if (!delivery) {
-      db.setCampaignStatus(campaignId, 'done', null)
+      await db.setCampaignStatus(campaignId, 'done', null)
       return
     }
     try {
-      await wa.sendText(
-        campaign.chip_id,
-        delivery.phone,
-        applyTemplate(campaign.message, delivery)
-      )
-      db.markDelivery(delivery.id, 'sent', null)
+      await wa.sendText(campaign.chip_id, delivery.phone, applyTemplate(campaign.message, delivery))
+      await db.markDelivery(delivery.id, campaignId, 'sent', null)
     } catch (error) {
       const message = error?.message || 'Falha no envio'
-      db.markDelivery(delivery.id, 'failed', message)
+      await db.markDelivery(delivery.id, campaignId, 'failed', message)
       if (shouldPause(message)) {
-        db.setCampaignStatus(campaignId, 'paused', message)
+        await db.setCampaignStatus(campaignId, 'paused', message)
         return
       }
     }
-    const fresh = db.getCampaignRaw(campaignId)
+    const fresh = await db.getCampaignRaw(campaignId)
     if (!fresh || fresh.status !== 'running') return
     await sleep(Math.max(3, fresh.interval_sec) * 1000)
   }
@@ -54,13 +50,44 @@ export function kick(campaignId) {
   if (running.has(campaignId)) return
   running.add(campaignId)
   work(campaignId)
-    .catch((error) => {
+    .catch(async (error) => {
       console.error(error)
-      db.setCampaignStatus(campaignId, 'paused', error.message || 'Falha no disparo')
+      await db.setCampaignStatus(campaignId, 'paused', error.message || 'Falha no disparo')
     })
     .finally(() => running.delete(campaignId))
 }
 
-export function resumeRunning() {
-  for (const campaign of db.runningCampaigns()) kick(campaign.id)
+export async function tick(userId) {
+  const campaigns = await db.runningCampaigns(userId)
+  for (const campaign of campaigns) {
+    const chip = await db.getChipById(campaign.chip_id)
+    if (!chip?.active) continue
+    if (!wa.isConnected(chip.id)) {
+      if (!wa.isPending(chip.id)) wa.connectChip(chip).catch((error) => console.error(error))
+      continue
+    }
+    if (!(await db.claimTick(campaign.id))) continue
+    const delivery = await db.nextPending(campaign.id)
+    if (!delivery) {
+      await db.setCampaignStatus(campaign.id, 'done', null)
+      continue
+    }
+    try {
+      await wa.sendText(chip.id, delivery.phone, applyTemplate(campaign.message, delivery))
+      await db.markDelivery(delivery.id, campaign.id, 'sent', null)
+    } catch (error) {
+      const message = error?.message || 'Falha no envio'
+      await db.markDelivery(delivery.id, campaign.id, 'failed', message)
+      if (shouldPause(message)) await db.setCampaignStatus(campaign.id, 'paused', message)
+    }
+  }
+}
+
+export async function resumeRunning() {
+  const chips = await db.allActiveChips()
+  const users = [...new Set(chips.map((chip) => chip.user_id))]
+  for (const userId of users) {
+    const campaigns = await db.runningCampaigns(userId)
+    for (const campaign of campaigns) kick(campaign.id)
+  }
 }

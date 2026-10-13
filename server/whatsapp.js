@@ -1,25 +1,23 @@
-import fs from 'node:fs'
-import path from 'node:path'
 import pino from 'pino'
 import QRCode from 'qrcode'
-
-const sessionsDir = path.resolve(import.meta.dirname, '..', 'sessions')
-fs.mkdirSync(sessionsDir, { recursive: true })
+import { useFirestoreAuthState, clearAuth } from './auth-state.js'
 
 const logger = pino({ level: 'silent' })
-const sockets = new Map()
-const qrCodes = new Map()
-const generation = new Map()
-const retries = new Map()
+const sockets = globalThis.__disparoSockets || new Map()
+const qrCodes = globalThis.__disparoQr || new Map()
+const generation = globalThis.__disparoGen || new Map()
+const retries = globalThis.__disparoRetries || new Map()
+const starting = globalThis.__disparoStarting || new Set()
+globalThis.__disparoSockets = sockets
+globalThis.__disparoQr = qrCodes
+globalThis.__disparoGen = generation
+globalThis.__disparoRetries = retries
+globalThis.__disparoStarting = starting
 let hooks = {
   onStatus() {},
   onMessage() {}
 }
 let baileysPromise
-
-function sessionDir(chipId) {
-  return path.join(sessionsDir, String(chipId))
-}
 
 async function loadBaileys() {
   if (!baileysPromise) baileysPromise = import('@whiskeysockets/baileys')
@@ -79,9 +77,15 @@ export function isConnected(chipId) {
   return Boolean(sockets.get(chipId)?.sock?.user)
 }
 
+export function isPending(chipId) {
+  return starting.has(chipId) || (sockets.has(chipId) && !sockets.get(chipId)?.sock?.user)
+}
+
 export async function connectChip(chip, { fresh = false } = {}) {
+  if (!fresh && (starting.has(chip.id) || isConnected(chip.id))) return
   const gen = (generation.get(chip.id) || 0) + 1
   generation.set(chip.id, gen)
+  starting.add(chip.id)
   if (fresh) retries.set(chip.id, 0)
   qrCodes.delete(chip.id)
   const previous = sockets.get(chip.id)
@@ -89,25 +93,41 @@ export async function connectChip(chip, { fresh = false } = {}) {
   if (previous?.sock) {
     try { previous.sock.end(undefined) } catch { /* encerra a sessão anterior */ }
   }
-  hooks.onStatus(chip.id, { status: 'connecting', lastError: null, active: 1 })
+  hooks.onStatus(chip.id, { status: 'connecting', lastError: null, active: 1, qr: null })
+  hold(chip.id)
 
   let mod
   try {
     mod = await loadBaileys()
   } catch (error) {
+    starting.delete(chip.id)
     hooks.onStatus(chip.id, { status: 'error', lastError: 'Falha ao carregar a conexão do WhatsApp' })
     console.error(error)
     return
   }
-  if (generation.get(chip.id) !== gen) return
+  if (generation.get(chip.id) !== gen) {
+    starting.delete(chip.id)
+    return
+  }
 
-  const dir = sessionDir(chip.id)
-  fs.mkdirSync(dir, { recursive: true })
-  const { state, saveCreds } = await mod.useMultiFileAuthState(dir)
+  let state
+  let saveCreds
+  try {
+    ;({ state, saveCreds } = await useFirestoreAuthState(chip.id))
+  } catch (error) {
+    starting.delete(chip.id)
+    console.error(error)
+    hooks.onStatus(chip.id, { status: 'error', lastError: 'Não foi possível abrir a sessão no Firebase' })
+    return
+  }
   const version = await waVersion(mod)
-  if (generation.get(chip.id) !== gen) return
+  if (generation.get(chip.id) !== gen) {
+    starting.delete(chip.id)
+    return
+  }
   const makeWASocket = mod.default?.makeWASocket || mod.makeWASocket || mod.default
   if (typeof makeWASocket !== 'function') {
+    starting.delete(chip.id)
     hooks.onStatus(chip.id, { status: 'error', lastError: 'Biblioteca do WhatsApp em formato inesperado' })
     return
   }
@@ -125,9 +145,11 @@ export async function connectChip(chip, { fresh = false } = {}) {
     })
   } catch (error) {
     console.error(error)
+    starting.delete(chip.id)
     hooks.onStatus(chip.id, { status: 'error', lastError: 'Não foi possível abrir a conexão' })
     return
   }
+  starting.delete(chip.id)
   sockets.set(chip.id, { sock })
   sock.ev.on('creds.update', saveCreds)
 
@@ -138,7 +160,7 @@ export async function connectChip(chip, { fresh = false } = {}) {
       try {
         const dataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 280 })
         qrCodes.set(chip.id, dataUrl)
-        hooks.onStatus(chip.id, { status: 'qr', lastError: null })
+        hooks.onStatus(chip.id, { status: 'qr', lastError: null, qr: dataUrl })
       } catch (error) {
         console.error(error)
       }
@@ -150,7 +172,8 @@ export async function connectChip(chip, { fresh = false } = {}) {
         status: 'connected',
         phone: phoneFromUser(sock),
         lastError: null,
-        active: 1
+        active: 1,
+        qr: null
       })
     }
     if (connection === 'close') {
@@ -162,8 +185,8 @@ export async function connectChip(chip, { fresh = false } = {}) {
       if (generation.get(chip.id) !== gen) return
       generation.set(chip.id, gen + 1)
       if (loggedOut) {
-        fs.rmSync(dir, { recursive: true, force: true })
-        hooks.onStatus(chip.id, { status: 'disconnected', active: 0, lastError: null, phone: null })
+        clearAuth(chip.id).catch((error) => console.error(error))
+        hooks.onStatus(chip.id, { status: 'disconnected', active: 0, lastError: null, phone: null, qr: null })
         return
       }
       const attempt = (retries.get(chip.id) || 0) + (restart ? 0 : 1)
@@ -217,7 +240,27 @@ export async function disconnectChip(chipId) {
       try { entry.sock.end(undefined) } catch { /* sessão já encerrada */ }
     }
   }
-  fs.rmSync(sessionDir(chipId), { recursive: true, force: true })
+  await clearAuth(chipId)
+}
+
+function hold(chipId) {
+  if (!process.env.VERCEL) return
+  import('@vercel/functions')
+    .then(({ waitUntil }) => {
+      waitUntil(new Promise((resolve) => {
+        const timer = setInterval(() => {
+          if (!sockets.has(chipId) && !starting.has(chipId)) {
+            clearInterval(timer)
+            resolve()
+          }
+        }, 1000)
+        setTimeout(() => {
+          clearInterval(timer)
+          resolve()
+        }, 55000)
+      }))
+    })
+    .catch(() => {})
 }
 
 export async function removeChipSession(chipId) {

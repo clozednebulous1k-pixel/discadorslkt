@@ -488,7 +488,7 @@ document.addEventListener('click', async (event) => {
   const button = event.target.closest('[data-action]')
   if (!button) return
   const action = button.dataset.action
-  const id = Number(button.dataset.id)
+  const id = button.dataset.id
   try {
     if (action === 'auth-mode') {
       state.authMode = state.authMode === 'login' ? 'register' : 'login'
@@ -595,8 +595,6 @@ document.addEventListener('submit', async (event) => {
       toast(`${result.added} adicionados, ${result.skipped} repetidos, ${result.invalid} inválidos.`)
     } else if (form.dataset.form === 'campaign') {
       body.intervalSec = Number(body.intervalSec)
-      body.chipId = Number(body.chipId)
-      body.listId = Number(body.listId)
       await api('/api/campaigns', { method: 'POST', body })
       state.showComposer = false
       await loadPage()

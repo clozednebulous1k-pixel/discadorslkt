@@ -30,25 +30,32 @@ function parseCookies(req) {
   return cookies
 }
 
-function setSession(res, userId) {
-  const token = crypto.randomBytes(32).toString('hex')
-  db.createSession(token, userId)
-  res.setHeader('Set-Cookie', `sid=${token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}`)
+function cookie(value, maxAge) {
+  const secure = process.env.VERCEL ? '; Secure' : ''
+  return `sid=${value}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${maxAge}${secure}`
+}
+
+function setSession(res, token) {
+  res.setHeader('Set-Cookie', cookie(token, 60 * 60 * 24 * 30))
 }
 
 function clearSession(res) {
-  res.setHeader('Set-Cookie', 'sid=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0')
-}
-
-function auth(req, res, next) {
-  const user = db.getSessionUser(parseCookies(req).sid || '')
-  if (!user) return res.status(401).json({ error: 'Faça login para continuar' })
-  req.user = user
-  next()
+  res.setHeader('Set-Cookie', cookie('', 0))
 }
 
 function asyncRoute(fn) {
   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
+}
+
+async function auth(req, res, next) {
+  try {
+    const user = await db.getSessionUser(parseCookies(req).sid || '')
+    if (!user) return res.status(401).json({ error: 'Faça login para continuar' })
+    req.user = user
+    next()
+  } catch (error) {
+    next(error)
+  }
 }
 
 function isDirectJid(jid) {
@@ -93,10 +100,16 @@ function parseContactText(text) {
   return { rows, invalid }
 }
 
-app.get('/api/me', (req, res) => {
-  const user = db.getSessionUser(parseCookies(req).sid || '')
+function ensureChip(chip) {
+  if (!chip?.active || chip.status === 'disconnected') return
+  if (wa.isConnected(chip.id) || wa.isPending(chip.id)) return
+  wa.connectChip(chip).catch((error) => console.error(error))
+}
+
+app.get('/api/me', asyncRoute(async (req, res) => {
+  const user = await db.getSessionUser(parseCookies(req).sid || '')
   res.json({ user: user || null })
-})
+}))
 
 app.post('/api/auth/register', asyncRoute(async (req, res) => {
   const name = cleanName(req.body?.name, 'o nome')
@@ -106,12 +119,14 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
   if (!email.includes('@') || email.length > 120) return res.status(400).json({ error: 'E-mail inválido' })
   if (password.length < 6) return res.status(400).json({ error: 'A senha precisa ter pelo menos 6 caracteres' })
   try {
-    const user = db.createUser({
+    const user = await db.createUser({
       name: name.name,
       email,
       passwordHash: await bcrypt.hash(password, 10)
     })
-    setSession(res, user.id)
+    const token = crypto.randomBytes(32).toString('hex')
+    await db.createSession(token, user.id)
+    setSession(res, token)
     res.json({ user })
   } catch (error) {
     if (String(error.message).includes('UNIQUE')) {
@@ -124,99 +139,101 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase()
   const password = String(req.body?.password || '')
-  const user = db.findUserByEmail(email)
+  const user = await db.findUserByEmail(email)
   if (!user || !(await bcrypt.compare(password, user.password_hash))) {
     return res.status(401).json({ error: 'E-mail ou senha incorretos' })
   }
-  setSession(res, user.id)
+  const token = crypto.randomBytes(32).toString('hex')
+  await db.createSession(token, user.id)
+  setSession(res, token)
   res.json({ user: { id: user.id, name: user.name, email: user.email } })
 }))
 
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', asyncRoute(async (req, res) => {
   const token = parseCookies(req).sid
-  if (token) db.deleteSession(token)
+  if (token) await db.deleteSession(token)
   clearSession(res)
   res.json({ ok: true })
-})
+}))
 
-app.get('/api/dashboard', auth, (req, res) => {
-  res.json(db.dashboard(req.user.id))
-})
+app.get('/api/dashboard', auth, asyncRoute(async (req, res) => {
+  res.json(await db.dashboard(req.user.id))
+}))
 
-app.get('/api/chips', auth, (req, res) => {
-  const chips = db.listChips(req.user.id).map((chip) => ({
+app.get('/api/chips', auth, asyncRoute(async (req, res) => {
+  const chips = await db.listChips(req.user.id)
+  chips.forEach(ensureChip)
+  res.json(chips.map((chip) => ({
     ...chip,
     phoneLabel: formatPhone(chip.phone),
-    qr: chip.status === 'qr' ? wa.getQr(chip.id) : null
-  }))
-  res.json(chips)
-})
+    qr: chip.status === 'qr' ? (wa.getQr(chip.id) || chip.qr || null) : null
+  })))
+}))
 
-app.post('/api/chips', auth, (req, res) => {
+app.post('/api/chips', auth, asyncRoute(async (req, res) => {
   const name = cleanName(req.body?.name, 'o nome do chip')
   if (name.error) return res.status(400).json({ error: name.error })
-  const chip = db.createChip(req.user.id, name.name)
-  wa.connectChip(chip, { fresh: true }).catch((error) => {
+  const chip = await db.createChip(req.user.id, name.name)
+  wa.connectChip(chip, { fresh: true }).catch(async (error) => {
     console.error(error)
-    db.updateChip(chip.id, { status: 'error', lastError: 'Não foi possível iniciar a conexão' })
+    await db.updateChip(chip.id, { status: 'error', lastError: 'Não foi possível iniciar a conexão' })
   })
   res.status(201).json(chip)
-})
+}))
 
 app.post('/api/chips/:id/connect', auth, asyncRoute(async (req, res) => {
-  const chip = db.getChip(req.user.id, Number(req.params.id))
+  const chip = await db.getChip(req.user.id, req.params.id)
   if (!chip) return res.status(404).json({ error: 'Chip não encontrado' })
-  db.updateChip(chip.id, { active: 1, status: 'connecting', lastError: null })
+  await db.updateChip(chip.id, { active: 1, status: 'connecting', lastError: null, qr: null })
   wa.connectChip({ ...chip, active: 1 }, { fresh: true }).catch((error) => console.error(error))
   res.json({ ok: true })
 }))
 
 app.post('/api/chips/:id/disconnect', auth, asyncRoute(async (req, res) => {
-  const chip = db.getChip(req.user.id, Number(req.params.id))
+  const chip = await db.getChip(req.user.id, req.params.id)
   if (!chip) return res.status(404).json({ error: 'Chip não encontrado' })
   await wa.disconnectChip(chip.id)
-  db.updateChip(chip.id, { status: 'disconnected', active: 0, lastError: null })
+  await db.updateChip(chip.id, { status: 'disconnected', active: 0, lastError: null, qr: null })
   res.json({ ok: true })
 }))
 
 app.delete('/api/chips/:id', auth, asyncRoute(async (req, res) => {
-  const id = Number(req.params.id)
-  const chip = db.getChip(req.user.id, id)
+  const chip = await db.getChip(req.user.id, req.params.id)
   if (!chip) return res.status(404).json({ error: 'Chip não encontrado' })
-  await wa.removeChipSession(id)
-  db.deleteChip(req.user.id, id)
+  await wa.removeChipSession(chip.id)
+  await db.deleteChip(req.user.id, chip.id)
   res.json({ ok: true })
 }))
 
-app.get('/api/lists', auth, (req, res) => {
-  res.json(db.listLists(req.user.id))
-})
+app.get('/api/lists', auth, asyncRoute(async (req, res) => {
+  res.json(await db.listLists(req.user.id))
+}))
 
-app.post('/api/lists', auth, (req, res) => {
+app.post('/api/lists', auth, asyncRoute(async (req, res) => {
   const name = cleanName(req.body?.name, 'o nome da lista')
   if (name.error) return res.status(400).json({ error: name.error })
-  res.status(201).json(db.createList(req.user.id, name.name))
-})
+  res.status(201).json(await db.createList(req.user.id, name.name))
+}))
 
-app.delete('/api/lists/:id', auth, (req, res) => {
-  if (!db.deleteList(req.user.id, Number(req.params.id))) {
+app.delete('/api/lists/:id', auth, asyncRoute(async (req, res) => {
+  if (!(await db.deleteList(req.user.id, req.params.id))) {
     return res.status(404).json({ error: 'Lista não encontrada' })
   }
   res.json({ ok: true })
-})
+}))
 
-app.get('/api/lists/:id/contacts', auth, (req, res) => {
-  const result = db.listContacts(req.user.id, Number(req.params.id))
+app.get('/api/lists/:id/contacts', auth, asyncRoute(async (req, res) => {
+  const result = await db.listContacts(req.user.id, req.params.id)
   if (!result) return res.status(404).json({ error: 'Lista não encontrada' })
   result.contacts = result.contacts.map((contact) => ({
     ...contact,
     phoneLabel: formatPhone(contact.phone)
   }))
   res.json(result)
-})
+}))
 
-app.post('/api/lists/:id/contacts', auth, (req, res) => {
-  const list = db.getList(req.user.id, Number(req.params.id))
+app.post('/api/lists/:id/contacts', auth, asyncRoute(async (req, res) => {
+  const list = await db.getList(req.user.id, req.params.id)
   if (!list) return res.status(404).json({ error: 'Lista não encontrada' })
   let parsed
   if (typeof req.body?.text === 'string') parsed = parseContactText(req.body.text)
@@ -230,32 +247,33 @@ app.post('/api/lists/:id/contacts', auth, (req, res) => {
     return res.status(400).json({ error: 'Nenhum telefone válido encontrado', invalid: parsed.invalid.slice(0, 10) })
   }
   if (parsed.rows.length > 20000) return res.status(400).json({ error: 'Limite de 20.000 contatos por importação' })
-  const result = db.addContacts(list.id, parsed.rows)
+  const result = await db.addContacts(list.id, req.user.id, parsed.rows)
   res.json({ ...result, invalid: parsed.invalid.length })
-})
+}))
 
-app.delete('/api/contacts/:id', auth, (req, res) => {
-  if (!db.deleteContact(req.user.id, Number(req.params.id))) {
+app.delete('/api/contacts/:id', auth, asyncRoute(async (req, res) => {
+  if (!(await db.deleteContact(req.user.id, req.params.id))) {
     return res.status(404).json({ error: 'Contato não encontrado' })
   }
   res.json({ ok: true })
-})
+}))
 
-app.get('/api/campaigns', auth, (req, res) => {
-  res.json(db.listCampaigns(req.user.id))
-})
+app.get('/api/campaigns', auth, asyncRoute(async (req, res) => {
+  if (process.env.VERCEL) await campaigns.tick(req.user.id)
+  res.json(await db.listCampaigns(req.user.id))
+}))
 
-app.get('/api/campaigns/:id', auth, (req, res) => {
-  const campaign = db.getCampaign(req.user.id, Number(req.params.id))
+app.get('/api/campaigns/:id', auth, asyncRoute(async (req, res) => {
+  const campaign = await db.getCampaign(req.user.id, req.params.id)
   if (!campaign) return res.status(404).json({ error: 'Disparo não encontrado' })
   campaign.deliveries = campaign.deliveries.map((delivery) => ({
     ...delivery,
     phoneLabel: formatPhone(delivery.phone)
   }))
   res.json(campaign)
-})
+}))
 
-app.post('/api/campaigns', auth, (req, res) => {
+app.post('/api/campaigns', auth, asyncRoute(async (req, res) => {
   const name = cleanName(req.body?.name, 'o nome do disparo')
   if (name.error) return res.status(400).json({ error: name.error })
   const message = String(req.body?.message || '').trim()
@@ -265,16 +283,16 @@ app.post('/api/campaigns', auth, (req, res) => {
   if (!Number.isInteger(intervalSec) || intervalSec < 3 || intervalSec > 180) {
     return res.status(400).json({ error: 'O intervalo deve ficar entre 3 e 180 segundos' })
   }
-  const chip = db.getChip(req.user.id, Number(req.body?.chipId))
+  const chip = await db.getChip(req.user.id, req.body?.chipId)
   if (!chip) return res.status(400).json({ error: 'Selecione um chip' })
-  if (chip.status !== 'connected' || !wa.isConnected(chip.id)) {
+  if (chip.status !== 'connected' && !wa.isConnected(chip.id)) {
     return res.status(400).json({ error: 'O chip precisa estar conectado' })
   }
-  const list = db.getList(req.user.id, Number(req.body?.listId))
+  const list = await db.getList(req.user.id, req.body?.listId)
   if (!list) return res.status(400).json({ error: 'Selecione uma lista' })
-  const contacts = db.listContactRows(list.id)
+  const contacts = await db.listContactRows(list.id)
   if (!contacts.length) return res.status(400).json({ error: 'A lista não tem contatos' })
-  const campaign = db.createCampaign({
+  const campaign = await db.createCampaign({
     userId: req.user.id,
     chip,
     list,
@@ -283,66 +301,72 @@ app.post('/api/campaigns', auth, (req, res) => {
     intervalSec,
     contacts
   })
-  campaigns.kick(campaign.id)
+  if (process.env.VERCEL) ensureChip(chip)
+  else campaigns.kick(campaign.id)
   res.status(201).json(campaign)
-})
+}))
 
-app.post('/api/campaigns/:id/pause', auth, (req, res) => {
-  const campaign = db.getCampaign(req.user.id, Number(req.params.id))
+app.post('/api/campaigns/:id/pause', auth, asyncRoute(async (req, res) => {
+  const campaign = await db.getCampaign(req.user.id, req.params.id)
   if (!campaign) return res.status(404).json({ error: 'Disparo não encontrado' })
-  if (campaign.status === 'running') db.setCampaignStatus(campaign.id, 'paused', null)
-  res.json(db.getCampaign(req.user.id, campaign.id))
-})
+  if (campaign.status === 'running') await db.setCampaignStatus(campaign.id, 'paused', null)
+  res.json(await db.getCampaign(req.user.id, campaign.id))
+}))
 
-app.post('/api/campaigns/:id/resume', auth, (req, res) => {
-  const campaign = db.getCampaign(req.user.id, Number(req.params.id))
+app.post('/api/campaigns/:id/resume', auth, asyncRoute(async (req, res) => {
+  const campaign = await db.getCampaign(req.user.id, req.params.id)
   if (!campaign) return res.status(404).json({ error: 'Disparo não encontrado' })
   if (campaign.status === 'cancelled' || campaign.status === 'done') {
     return res.status(400).json({ error: 'Esse disparo já foi encerrado' })
   }
-  const chip = db.getChip(req.user.id, campaign.chip_id)
-  if (!chip || chip.status !== 'connected' || !wa.isConnected(chip.id)) {
+  const chip = await db.getChip(req.user.id, campaign.chip_id)
+  if (!chip || (chip.status !== 'connected' && !wa.isConnected(chip.id))) {
     return res.status(400).json({ error: 'Conecte o chip antes de retomar' })
   }
-  db.setCampaignStatus(campaign.id, 'running', null)
-  campaigns.kick(campaign.id)
-  res.json(db.getCampaign(req.user.id, campaign.id))
-})
+  await db.setCampaignStatus(campaign.id, 'running', null)
+  if (process.env.VERCEL) ensureChip(chip)
+  else campaigns.kick(campaign.id)
+  res.json(await db.getCampaign(req.user.id, campaign.id))
+}))
 
-app.post('/api/campaigns/:id/cancel', auth, (req, res) => {
-  const campaign = db.getCampaign(req.user.id, Number(req.params.id))
+app.post('/api/campaigns/:id/cancel', auth, asyncRoute(async (req, res) => {
+  const campaign = await db.getCampaign(req.user.id, req.params.id)
   if (!campaign) return res.status(404).json({ error: 'Disparo não encontrado' })
   if (campaign.status === 'running' || campaign.status === 'paused') {
-    db.setCampaignStatus(campaign.id, 'cancelled', null)
+    await db.setCampaignStatus(campaign.id, 'cancelled', null)
   }
-  res.json(db.getCampaign(req.user.id, campaign.id))
-})
+  res.json(await db.getCampaign(req.user.id, campaign.id))
+}))
 
-app.get('/api/chips/:id/chats', auth, (req, res) => {
-  const chats = db.listChats(req.user.id, Number(req.params.id))
-  if (!chats) return res.status(404).json({ error: 'Chip não encontrado' })
-  res.json(chats)
-})
+app.get('/api/chips/:id/chats', auth, asyncRoute(async (req, res) => {
+  const chip = await db.getChip(req.user.id, req.params.id)
+  if (!chip) return res.status(404).json({ error: 'Chip não encontrado' })
+  ensureChip(chip)
+  res.json(await db.listChats(req.user.id, chip.id))
+}))
 
-app.get('/api/chips/:id/messages', auth, (req, res) => {
+app.get('/api/chips/:id/messages', auth, asyncRoute(async (req, res) => {
   const jid = String(req.query.jid || '')
   if (!isDirectJid(jid)) return res.status(400).json({ error: 'Conversa inválida' })
-  const messages = db.listMessages(req.user.id, Number(req.params.id), jid)
+  const messages = await db.listMessages(req.user.id, req.params.id, jid)
   if (!messages) return res.status(404).json({ error: 'Chip não encontrado' })
   res.json(messages)
-})
+}))
 
 app.post('/api/chips/:id/send', auth, asyncRoute(async (req, res) => {
-  const chip = db.getChip(req.user.id, Number(req.params.id))
+  const chip = await db.getChip(req.user.id, req.params.id)
   if (!chip) return res.status(404).json({ error: 'Chip não encontrado' })
   const text = String(req.body?.text || '').trim()
   if (!text) return res.status(400).json({ error: 'Escreva a mensagem' })
   if (text.length > 4000) return res.status(400).json({ error: 'A mensagem passa de 4.000 caracteres' })
   const jid = String(req.body?.jid || '')
   if (!isDirectJid(jid)) return res.status(400).json({ error: 'Conversa inválida' })
-  if (!wa.isConnected(chip.id)) return res.status(400).json({ error: 'Chip desconectado' })
+  if (!wa.isConnected(chip.id)) {
+    ensureChip(chip)
+    return res.status(400).json({ error: 'Chip reconectando. Tente de novo em alguns segundos.' })
+  }
   const sent = await wa.sendToJid(chip.id, jid, text)
-  db.saveChatMessage({
+  await db.saveChatMessage({
     chipId: chip.id,
     jid,
     name: null,
@@ -359,25 +383,44 @@ app.use(express.static(publicDir))
 app.use((error, req, res, next) => {
   console.error(error)
   if (res.headersSent) return next(error)
-  res.status(500).json({ error: 'Erro interno. Tente de novo.' })
+  const message = String(error.message || '')
+  const publico = message.includes('Firebase') ? message : 'Erro interno. Tente de novo.'
+  res.status(500).json({ error: publico })
 })
 
-wa.init({
-  onStatus(chipId, patch) {
-    db.updateChip(chipId, patch)
-  },
-  onMessage(message) {
-    db.saveChatMessage(message)
-  }
-})
-
-for (const [index, chip] of db.allActiveChips().entries()) {
-  setTimeout(() => {
-    wa.connectChip(chip).catch((error) => console.error(error))
-  }, index * 1200)
+export async function boot() {
+  if (globalThis.__disparoBoot) return globalThis.__disparoBoot
+  globalThis.__disparoBoot = (async () => {
+    wa.init({
+      onStatus(chipId, patch) {
+        db.updateChip(chipId, patch).catch((error) => console.error(error))
+      },
+      onMessage(message) {
+        db.saveChatMessage(message).catch((error) => console.error(error))
+      }
+    })
+    if (!process.env.VERCEL) {
+      const chips = await db.allActiveChips()
+      chips.forEach((chip, index) => {
+        setTimeout(() => {
+          wa.connectChip(chip).catch((error) => console.error(error))
+        }, index * 1200)
+      })
+      await campaigns.resumeRunning()
+    }
+  })()
+  return globalThis.__disparoBoot
 }
-campaigns.resumeRunning()
 
-app.listen(port, () => {
-  console.log(`Disparo em http://localhost:${port}`)
-})
+export { app }
+
+if (!process.env.VERCEL) {
+  boot().then(() => {
+    app.listen(port, () => {
+      console.log(`Disparo em http://localhost:${port}`)
+    })
+  }).catch((error) => {
+    console.error(error)
+    process.exit(1)
+  })
+}

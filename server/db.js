@@ -1,467 +1,382 @@
-import fs from 'node:fs'
-import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
+import { C, fs, gravarEmLotes, lerVarios, agora } from './firebase.js'
 
-const dataDir = path.resolve(import.meta.dirname, '..', 'data')
-fs.mkdirSync(dataDir, { recursive: true })
-
-const db = new DatabaseSync(path.join(dataDir, 'app.db'))
-db.exec('PRAGMA journal_mode = WAL')
-db.exec('PRAGMA foreign_keys = ON')
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS sessions (
-    token TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL,
-    created_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS chips (
-    id INTEGER PRIMARY KEY,
-    user_id INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    phone TEXT,
-    status TEXT NOT NULL DEFAULT 'connecting',
-    last_error TEXT,
-    active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS lists (
-    id INTEGER PRIMARY KEY,
-    user_id INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS contacts (
-    id INTEGER PRIMARY KEY,
-    list_id INTEGER NOT NULL,
-    name TEXT NOT NULL DEFAULT '',
-    phone TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    UNIQUE(list_id, phone)
-  );
-
-  CREATE TABLE IF NOT EXISTS campaigns (
-    id INTEGER PRIMARY KEY,
-    user_id INTEGER NOT NULL,
-    chip_id INTEGER,
-    chip_name TEXT NOT NULL,
-    list_id INTEGER,
-    list_name TEXT NOT NULL,
-    name TEXT NOT NULL,
-    message TEXT NOT NULL,
-    interval_sec INTEGER NOT NULL,
-    status TEXT NOT NULL,
-    error TEXT,
-    created_at TEXT NOT NULL,
-    finished_at TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS deliveries (
-    id INTEGER PRIMARY KEY,
-    campaign_id INTEGER NOT NULL,
-    contact_name TEXT NOT NULL DEFAULT '',
-    phone TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    error TEXT,
-    sent_at TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS chats (
-    id INTEGER PRIMARY KEY,
-    chip_id INTEGER NOT NULL,
-    jid TEXT NOT NULL,
-    name TEXT,
-    last_message TEXT,
-    last_at TEXT,
-    UNIQUE(chip_id, jid)
-  );
-
-  CREATE TABLE IF NOT EXISTS chat_messages (
-    id INTEGER PRIMARY KEY,
-    chip_id INTEGER NOT NULL,
-    jid TEXT NOT NULL,
-    from_me INTEGER NOT NULL,
-    body TEXT NOT NULL,
-    wa_id TEXT,
-    created_at TEXT NOT NULL
-  );
-
-  CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_wa
-    ON chat_messages(chip_id, wa_id) WHERE wa_id IS NOT NULL;
-`)
-
-function now() {
-  return new Date().toISOString()
+function doc(snapshot) {
+  if (!snapshot?.exists) return null
+  return { id: snapshot.id, ...snapshot.data() }
 }
 
-function one(sql, ...params) {
-  return db.prepare(sql).get(...params)
+function lista(snapshot) {
+  return snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))
 }
 
-function all(sql, ...params) {
-  return db.prepare(sql).all(...params)
+function porData(itens) {
+  return [...itens].sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
 }
 
-function run(sql, ...params) {
-  return db.prepare(sql).run(...params)
-}
-
-export function createUser({ name, email, passwordHash }) {
-  const result = run(
-    'INSERT INTO users (name, email, password_hash, created_at) VALUES (?, ?, ?, ?)',
-    name,
-    email,
-    passwordHash,
-    now()
-  )
-  return findUserById(Number(result.lastInsertRowid))
-}
-
-export function findUserByEmail(email) {
-  return one('SELECT * FROM users WHERE email = ?', email)
-}
-
-export function findUserById(id) {
-  return one('SELECT id, name, email, created_at FROM users WHERE id = ?', id)
-}
-
-export function createSession(token, userId) {
-  run('INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)', token, userId, now())
-}
-
-export function getSessionUser(token) {
-  return one(
-    `SELECT u.id, u.name, u.email
-     FROM sessions s JOIN users u ON u.id = s.user_id
-     WHERE s.token = ?`,
-    token
-  )
-}
-
-export function deleteSession(token) {
-  run('DELETE FROM sessions WHERE token = ?', token)
-}
-
-export function createChip(userId, name) {
-  const result = run(
-    'INSERT INTO chips (user_id, name, status, active, created_at) VALUES (?, ?, ?, 1, ?)',
-    userId,
-    name,
-    'connecting',
-    now()
-  )
-  return getChip(userId, Number(result.lastInsertRowid))
-}
-
-export function listChips(userId) {
-  return all('SELECT * FROM chips WHERE user_id = ? ORDER BY id DESC', userId)
-}
-
-export function getChip(userId, id) {
-  return one('SELECT * FROM chips WHERE id = ? AND user_id = ?', id, userId)
-}
-
-export function getChipById(id) {
-  return one('SELECT * FROM chips WHERE id = ?', id)
-}
-
-export function allActiveChips() {
-  return all('SELECT * FROM chips WHERE active = 1')
-}
-
-export function updateChip(id, patch) {
-  const current = getChipById(id)
-  if (!current) return
-  run(
-    'UPDATE chips SET status = ?, phone = ?, last_error = ?, active = ? WHERE id = ?',
-    patch.status ?? current.status,
-    patch.phone === undefined ? current.phone : patch.phone,
-    patch.lastError === undefined ? current.last_error : patch.lastError,
-    patch.active === undefined ? current.active : patch.active,
-    id
-  )
-}
-
-export function deleteChip(userId, id) {
-  const chip = getChip(userId, id)
-  if (!chip) return false
-  run(`UPDATE campaigns SET status = 'cancelled', finished_at = ? WHERE chip_id = ? AND status IN ('running', 'paused')`, now(), id)
-  run('DELETE FROM chat_messages WHERE chip_id = ?', id)
-  run('DELETE FROM chats WHERE chip_id = ?', id)
-  run('DELETE FROM chips WHERE id = ? AND user_id = ?', id, userId)
-  return true
-}
-
-export function createList(userId, name) {
-  const result = run(
-    'INSERT INTO lists (user_id, name, created_at) VALUES (?, ?, ?)',
-    userId,
-    name,
-    now()
-  )
-  return getList(userId, Number(result.lastInsertRowid))
-}
-
-export function listLists(userId) {
-  return all(
-    `SELECT l.*, (SELECT COUNT(*) FROM contacts c WHERE c.list_id = l.id) AS total
-     FROM lists l WHERE l.user_id = ? ORDER BY l.id DESC`,
-    userId
-  )
-}
-
-export function getList(userId, id) {
-  return one('SELECT * FROM lists WHERE id = ? AND user_id = ?', id, userId)
-}
-
-export function deleteList(userId, id) {
-  const list = getList(userId, id)
-  if (!list) return false
-  run('DELETE FROM contacts WHERE list_id = ?', id)
-  run('DELETE FROM lists WHERE id = ? AND user_id = ?', id, userId)
-  return true
-}
-
-export function addContacts(listId, contacts) {
-  const insert = db.prepare(
-    'INSERT OR IGNORE INTO contacts (list_id, name, phone, created_at) VALUES (?, ?, ?, ?)'
-  )
-  let added = 0
-  db.exec('BEGIN')
-  try {
-    for (const contact of contacts) {
-      const result = insert.run(listId, contact.name || '', contact.phone, now())
-      added += Number(result.changes)
-    }
-    db.exec('COMMIT')
-  } catch (error) {
-    db.exec('ROLLBACK')
+export async function createUser({ name, email, passwordHash }) {
+  const existente = await findUserByEmail(email)
+  if (existente) {
+    const error = new Error('UNIQUE')
     throw error
   }
+  const ref = C('users').doc()
+  const user = { name, email, password_hash: passwordHash, created_at: agora() }
+  await ref.set(user)
+  return { id: ref.id, name, email, created_at: user.created_at }
+}
+
+export async function findUserByEmail(email) {
+  const snap = await C('users').where('email', '==', email).limit(1).get()
+  return snap.empty ? null : doc(snap.docs[0])
+}
+
+export async function createSession(token, userId) {
+  await C('sessions').doc(token).set({ user_id: userId, created_at: agora() })
+}
+
+export async function getSessionUser(token) {
+  if (!token) return null
+  const session = await C('sessions').doc(token).get()
+  if (!session.exists) return null
+  const user = await C('users').doc(session.data().user_id).get()
+  if (!user.exists) return null
+  const data = user.data()
+  return { id: user.id, name: data.name, email: data.email }
+}
+
+export async function deleteSession(token) {
+  if (!token) return
+  await C('sessions').doc(token).delete().catch(() => {})
+}
+
+export async function createChip(userId, name) {
+  const ref = C('chips').doc()
+  const chip = {
+    user_id: userId,
+    name,
+    phone: null,
+    status: 'connecting',
+    last_error: null,
+    qr: null,
+    active: 1,
+    created_at: agora()
+  }
+  await ref.set(chip)
+  return { id: ref.id, ...chip }
+}
+
+export async function listChips(userId) {
+  const snap = await C('chips').where('user_id', '==', userId).get()
+  return porData(lista(snap))
+}
+
+export async function getChip(userId, id) {
+  const snap = await C('chips').doc(String(id)).get()
+  const chip = doc(snap)
+  if (!chip || chip.user_id !== userId) return null
+  return chip
+}
+
+export async function getChipById(id) {
+  return doc(await C('chips').doc(String(id)).get())
+}
+
+export async function allActiveChips() {
+  const snap = await C('chips').where('active', '==', 1).get()
+  return lista(snap)
+}
+
+export async function updateChip(id, patch) {
+  const data = {}
+  if (patch.status !== undefined) data.status = patch.status
+  if (patch.phone !== undefined) data.phone = patch.phone
+  if (patch.lastError !== undefined) data.last_error = patch.lastError
+  if (patch.active !== undefined) data.active = patch.active
+  if (patch.qr !== undefined) data.qr = patch.qr
+  if (!Object.keys(data).length) return
+  await C('chips').doc(String(id)).set(data, { merge: true })
+}
+
+async function apagarConsulta(query) {
+  const snap = await query.limit(200).get()
+  if (snap.empty) return
+  const lote = fs.batch()
+  snap.docs.forEach((item) => lote.delete(item.ref))
+  await lote.commit()
+  if (snap.size === 200) await apagarConsulta(query)
+}
+
+async function apagarMensagens(chatId) {
+  const ref = C('chats').doc(chatId).collection('messages')
+  const snap = await ref.limit(200).get()
+  if (snap.empty) return
+  const lote = fs.batch()
+  snap.docs.forEach((item) => lote.delete(item.ref))
+  await lote.commit()
+  if (snap.size === 200) await apagarMensagens(chatId)
+}
+
+export async function deleteChip(userId, id) {
+  const chip = await getChip(userId, id)
+  if (!chip) return false
+  const campaigns = await C('campaigns').where('chip_id', '==', id).get()
+  const lote = fs.batch()
+  campaigns.docs.forEach((item) => {
+    if (['running', 'paused'].includes(item.data().status)) {
+      lote.set(item.ref, { status: 'cancelled', finished_at: agora() }, { merge: true })
+    }
+  })
+  await lote.commit()
+  const chats = await C('chats').where('chip_id', '==', id).get()
+  for (const chat of chats.docs) {
+    await apagarMensagens(chat.id)
+    await chat.ref.delete()
+  }
+  await C('chips').doc(String(id)).delete()
+  return true
+}
+
+export async function createList(userId, name) {
+  const ref = C('lists').doc()
+  const list = { user_id: userId, name, created_at: agora() }
+  await ref.set(list)
+  return { id: ref.id, ...list, total: 0 }
+}
+
+export async function listLists(userId) {
+  const snap = await C('lists').where('user_id', '==', userId).get()
+  const lists = porData(lista(snap))
+  const contacts = await C('contacts').where('user_id', '==', userId).get()
+  const totais = new Map()
+  contacts.docs.forEach((item) => {
+    const listId = item.data().list_id
+    totais.set(listId, (totais.get(listId) || 0) + 1)
+  })
+  return lists.map((list) => ({ ...list, total: totais.get(list.id) || 0 }))
+}
+
+export async function getList(userId, id) {
+  const list = doc(await C('lists').doc(String(id)).get())
+  if (!list || list.user_id !== userId) return null
+  return list
+}
+
+export async function deleteList(userId, id) {
+  const list = await getList(userId, id)
+  if (!list) return false
+  await apagarConsulta(C('contacts').where('list_id', '==', id))
+  await C('lists').doc(String(id)).delete()
+  return true
+}
+
+export async function addContacts(listId, userId, contacts) {
+  const refs = contacts.map((contact) => C('contacts').doc(`${listId}_${contact.phone}`))
+  const atuais = refs.length ? await lerVarios(refs) : []
+  const operacoes = []
+  let added = 0
+  atuais.forEach((snap, index) => {
+    if (snap.exists) return
+    added += 1
+    const contact = contacts[index]
+    operacoes.push((lote) => lote.set(refs[index], {
+      list_id: listId,
+      user_id: userId,
+      name: contact.name || '',
+      phone: contact.phone,
+      created_at: agora()
+    }))
+  })
+  await gravarEmLotes(operacoes)
   return { added, skipped: contacts.length - added }
 }
 
-export function listContacts(userId, listId) {
-  const list = getList(userId, listId)
+export async function listContacts(userId, listId) {
+  const list = await getList(userId, listId)
   if (!list) return null
-  const contacts = all(
-    'SELECT * FROM contacts WHERE list_id = ? ORDER BY id DESC LIMIT 5000',
-    listId
-  )
-  const total = one('SELECT COUNT(*) AS total FROM contacts WHERE list_id = ?', listId).total
-  return { list, contacts, total }
+  const snap = await C('contacts').where('list_id', '==', listId).get()
+  const contacts = porData(lista(snap)).slice(0, 5000)
+  return { list, contacts, total: snap.size }
 }
 
-export function listContactRows(listId) {
-  return all('SELECT name, phone FROM contacts WHERE list_id = ? ORDER BY id', listId)
+export async function listContactRows(listId) {
+  const snap = await C('contacts').where('list_id', '==', listId).get()
+  return lista(snap).map((contact) => ({ name: contact.name, phone: contact.phone }))
 }
 
-export function deleteContact(userId, contactId) {
-  const contact = one(
-    `SELECT c.id FROM contacts c
-     JOIN lists l ON l.id = c.list_id
-     WHERE c.id = ? AND l.user_id = ?`,
-    contactId,
-    userId
-  )
-  if (!contact) return false
-  run('DELETE FROM contacts WHERE id = ?', contactId)
+export async function deleteContact(userId, contactId) {
+  const ref = C('contacts').doc(String(contactId))
+  const contact = doc(await ref.get())
+  if (!contact || contact.user_id !== userId) return false
+  await ref.delete()
   return true
 }
 
-export function createCampaign({ userId, chip, list, name, message, intervalSec, contacts }) {
-  const result = run(
-    `INSERT INTO campaigns
-      (user_id, chip_id, chip_name, list_id, list_name, name, message, interval_sec, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
-    userId,
-    chip.id,
-    chip.name,
-    list.id,
-    list.name,
+export async function createCampaign({ userId, chip, list, name, message, intervalSec, contacts }) {
+  const ref = C('campaigns').doc()
+  const campaign = {
+    user_id: userId,
+    chip_id: chip.id,
+    chip_name: chip.name,
+    list_id: list.id,
+    list_name: list.name,
     name,
     message,
-    intervalSec,
-    now()
-  )
-  const campaignId = Number(result.lastInsertRowid)
-  const insert = db.prepare(
-    'INSERT INTO deliveries (campaign_id, contact_name, phone, status) VALUES (?, ?, ?, ?)'
-  )
-  db.exec('BEGIN')
-  try {
-    for (const contact of contacts) {
-      insert.run(campaignId, contact.name || '', contact.phone, 'pending')
-    }
-    db.exec('COMMIT')
-  } catch (error) {
-    db.exec('ROLLBACK')
-    throw error
+    interval_sec: intervalSec,
+    status: 'running',
+    error: null,
+    total: contacts.length,
+    sent: 0,
+    failed: 0,
+    tick_at: null,
+    created_at: agora(),
+    finished_at: null
   }
-  return getCampaign(userId, campaignId)
+  await ref.set(campaign)
+  const operacoes = contacts.map((contact, index) => (lote) => lote.set(C('deliveries').doc(`${ref.id}_${index}`), {
+    campaign_id: ref.id,
+    user_id: userId,
+    seq: index,
+    contact_name: contact.name || '',
+    phone: contact.phone,
+    status: 'pending',
+    error: null,
+    sent_at: null
+  }))
+  await gravarEmLotes(operacoes)
+  return { id: ref.id, ...campaign, deliveries: [] }
 }
 
-export function listCampaigns(userId) {
-  return all(
-    `SELECT c.*,
-        (SELECT COUNT(*) FROM deliveries d WHERE d.campaign_id = c.id) AS total,
-        (SELECT COUNT(*) FROM deliveries d WHERE d.campaign_id = c.id AND d.status = 'sent') AS sent,
-        (SELECT COUNT(*) FROM deliveries d WHERE d.campaign_id = c.id AND d.status = 'failed') AS failed
-     FROM campaigns c
-     WHERE c.user_id = ?
-     ORDER BY c.id DESC`,
-    userId
-  )
+export async function listCampaigns(userId) {
+  const snap = await C('campaigns').where('user_id', '==', userId).get()
+  return porData(lista(snap))
 }
 
-export function getCampaign(userId, id) {
-  const campaign = one(
-    `SELECT c.*,
-        (SELECT COUNT(*) FROM deliveries d WHERE d.campaign_id = c.id) AS total,
-        (SELECT COUNT(*) FROM deliveries d WHERE d.campaign_id = c.id AND d.status = 'sent') AS sent,
-        (SELECT COUNT(*) FROM deliveries d WHERE d.campaign_id = c.id AND d.status = 'failed') AS failed
-     FROM campaigns c
-     WHERE c.id = ? AND c.user_id = ?`,
-    id,
-    userId
-  )
-  if (!campaign) return null
-  campaign.deliveries = all(
-    'SELECT * FROM deliveries WHERE campaign_id = ? ORDER BY id DESC LIMIT 200',
-    id
-  )
+export async function getCampaign(userId, id) {
+  const campaign = doc(await C('campaigns').doc(String(id)).get())
+  if (!campaign || campaign.user_id !== userId) return null
+  const snap = await C('deliveries').where('campaign_id', '==', id).get()
+  campaign.deliveries = lista(snap).sort((a, b) => b.seq - a.seq).slice(0, 200)
   return campaign
 }
 
-export function getCampaignRaw(id) {
-  return one('SELECT * FROM campaigns WHERE id = ?', id)
+export async function getCampaignRaw(id) {
+  return doc(await C('campaigns').doc(String(id)).get())
 }
 
-export function setCampaignStatus(id, status, error = null) {
-  const finished = status === 'done' || status === 'cancelled' ? now() : null
-  run(
-    'UPDATE campaigns SET status = ?, error = ?, finished_at = COALESCE(?, finished_at) WHERE id = ?',
-    status,
-    error,
-    finished,
-    id
-  )
+export async function setCampaignStatus(id, status, error = null) {
+  const data = { status, error }
+  if (status === 'done' || status === 'cancelled') data.finished_at = agora()
+  await C('campaigns').doc(String(id)).set(data, { merge: true })
 }
 
-export function nextPending(campaignId) {
-  return one(
-    `SELECT * FROM deliveries
-     WHERE campaign_id = ? AND status = 'pending'
-     ORDER BY id LIMIT 1`,
-    campaignId
-  )
+export async function claimTick(id) {
+  const ref = C('campaigns').doc(String(id))
+  return fs.runTransaction(async (tx) => {
+    const snap = await tx.get(ref)
+    if (!snap.exists) return false
+    const data = snap.data()
+    if (data.status !== 'running') return false
+    const wait = Math.max(3, Number(data.interval_sec) || 8) * 1000
+    const last = data.tick_at ? Date.parse(data.tick_at) : 0
+    if (last && Date.now() - last < wait) return false
+    tx.set(ref, { tick_at: new Date().toISOString() }, { merge: true })
+    return true
+  })
 }
 
-export function markDelivery(id, status, error) {
-  run(
-    'UPDATE deliveries SET status = ?, error = ?, sent_at = ? WHERE id = ?',
-    status,
-    error,
-    status === 'sent' ? now() : null,
-    id
-  )
+export async function nextPending(campaignId) {
+  const snap = await C('deliveries').where('campaign_id', '==', campaignId).get()
+  return lista(snap)
+    .filter((item) => item.status === 'pending')
+    .sort((a, b) => a.seq - b.seq)[0] || null
 }
 
-export function runningCampaigns() {
-  return all(`SELECT id FROM campaigns WHERE status = 'running'`)
+export async function markDelivery(id, campaignId, status, error) {
+  const deliveryRef = C('deliveries').doc(String(id))
+  const campaignRef = C('campaigns').doc(String(campaignId))
+  await fs.runTransaction(async (tx) => {
+    const campaign = (await tx.get(campaignRef)).data() || {}
+    tx.set(deliveryRef, {
+      status,
+      error: error || null,
+      sent_at: status === 'sent' ? agora() : null
+    }, { merge: true })
+    const patch = {}
+    if (status === 'sent') patch.sent = Number(campaign.sent || 0) + 1
+    if (status === 'failed') patch.failed = Number(campaign.failed || 0) + 1
+    tx.set(campaignRef, patch, { merge: true })
+  })
 }
 
-export function dashboard(userId) {
+export async function runningCampaigns(userId) {
+  const snap = await C('campaigns').where('user_id', '==', userId).get()
+  return lista(snap).filter((item) => item.status === 'running')
+}
+
+export async function dashboard(userId) {
   const start = new Date()
   start.setHours(0, 0, 0, 0)
-  const sentToday = one(
-    `SELECT COUNT(*) AS total
-     FROM deliveries d JOIN campaigns c ON c.id = d.campaign_id
-     WHERE c.user_id = ? AND d.status = 'sent' AND d.sent_at >= ?`,
-    userId,
-    start.toISOString()
-  ).total
+  const inicio = start.toISOString()
+  const [chips, lists, contacts, campaigns, deliveries] = await Promise.all([
+    C('chips').where('user_id', '==', userId).get(),
+    C('lists').where('user_id', '==', userId).get(),
+    C('contacts').where('user_id', '==', userId).get(),
+    C('campaigns').where('user_id', '==', userId).get(),
+    C('deliveries').where('user_id', '==', userId).get()
+  ])
+  const sentToday = deliveries.docs.filter((item) => {
+    const data = item.data()
+    return data.status === 'sent' && data.sent_at && data.sent_at >= inicio
+  }).length
   return {
-    chips: one('SELECT COUNT(*) AS total FROM chips WHERE user_id = ?', userId).total,
-    connected: one(`SELECT COUNT(*) AS total FROM chips WHERE user_id = ? AND status = 'connected'`, userId).total,
-    contacts: one(
-      `SELECT COUNT(*) AS total FROM contacts c
-       JOIN lists l ON l.id = c.list_id WHERE l.user_id = ?`,
-      userId
-    ).total,
-    lists: one('SELECT COUNT(*) AS total FROM lists WHERE user_id = ?', userId).total,
+    chips: chips.size,
+    connected: chips.docs.filter((item) => item.data().status === 'connected').length,
+    contacts: contacts.size,
+    lists: lists.size,
     sentToday,
-    campaigns: one('SELECT COUNT(*) AS total FROM campaigns WHERE user_id = ?', userId).total,
-    recent: listCampaigns(userId).slice(0, 5)
+    campaigns: campaigns.size,
+    recent: porData(lista(campaigns)).slice(0, 5)
   }
 }
 
-export function saveChatMessage({ chipId, jid, name, fromMe, body, waId, at }) {
+function chatId(chipId, jid) {
+  return `${chipId}__${String(jid).replace(/[^a-zA-Z0-9]/g, '_')}`
+}
+
+export async function saveChatMessage({ chipId, jid, name, fromMe, body, waId, at }) {
   if (!body || !jid) return
-  if (waId) {
-    run(
-      `INSERT OR IGNORE INTO chat_messages (chip_id, jid, from_me, body, wa_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      chipId,
-      jid,
-      fromMe ? 1 : 0,
-      body,
-      waId,
-      at
-    )
-  } else {
-    run(
-      `INSERT INTO chat_messages (chip_id, jid, from_me, body, wa_id, created_at)
-       VALUES (?, ?, ?, ?, NULL, ?)`,
-      chipId,
-      jid,
-      fromMe ? 1 : 0,
-      body,
-      at
-    )
-  }
-  run(
-    `INSERT INTO chats (chip_id, jid, name, last_message, last_at)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(chip_id, jid) DO UPDATE SET
-       name = COALESCE(excluded.name, chats.name),
-       last_message = excluded.last_message,
-       last_at = excluded.last_at`,
-    chipId,
+  const id = chatId(chipId, jid)
+  const chatRef = C('chats').doc(id)
+  const messageRef = waId
+    ? chatRef.collection('messages').doc(String(waId))
+    : chatRef.collection('messages').doc()
+  await messageRef.set({
+    chip_id: chipId,
     jid,
-    name || null,
+    from_me: Boolean(fromMe),
     body,
-    at
-  )
+    wa_id: waId || null,
+    created_at: at || agora()
+  })
+  await chatRef.set({
+    chip_id: chipId,
+    jid,
+    name: name || null,
+    last_message: body,
+    last_at: at || agora()
+  }, { merge: true })
 }
 
-export function listChats(userId, chipId) {
-  const chip = getChip(userId, chipId)
+export async function listChats(userId, chipId) {
+  const chip = await getChip(userId, chipId)
   if (!chip) return null
-  return all(
-    'SELECT * FROM chats WHERE chip_id = ? ORDER BY last_at DESC LIMIT 300',
-    chipId
-  )
+  const snap = await C('chats').where('chip_id', '==', chipId).get()
+  return lista(snap).sort((a, b) => String(b.last_at || '').localeCompare(String(a.last_at || ''))).slice(0, 300)
 }
 
-export function listMessages(userId, chipId, jid) {
-  const chip = getChip(userId, chipId)
+export async function listMessages(userId, chipId, jid) {
+  const chip = await getChip(userId, chipId)
   if (!chip) return null
-  return all(
-    `SELECT * FROM chat_messages
-     WHERE chip_id = ? AND jid = ?
-     ORDER BY id DESC LIMIT 200`,
-    chipId,
-    jid
-  ).reverse()
+  const snap = await C('chats').doc(chatId(chipId, jid)).collection('messages').orderBy('created_at').limitToLast(200).get()
+  return lista(snap)
 }
