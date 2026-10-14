@@ -73,7 +73,7 @@ async function api(path, options = {}) {
     render()
   }
   if (!response.ok) {
-    throw new Error(data.error || (response.status === 404 ? 'A API não respondeu. Aguarde o novo deploy e tente de novo.' : 'Não foi possível concluir'))
+    throw new Error(data.error || data.detalhe || (response.status === 404 ? 'A API não respondeu. Aguarde o novo deploy e tente de novo.' : 'Não foi possível concluir'))
   }
   return data
 }

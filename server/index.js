@@ -106,6 +106,16 @@ function ensureChip(chip) {
   wa.connectChip(chip).catch((error) => console.error(error))
 }
 
+app.get('/api/health', asyncRoute(async (req, res) => {
+  try {
+    const { C } = await import('./firebase.js')
+    await C('users').limit(1).get()
+    res.json({ ok: true, firebase: true })
+  } catch (error) {
+    res.status(500).json({ ok: false, firebase: false, error: error.message })
+  }
+}))
+
 app.get('/api/me', asyncRoute(async (req, res) => {
   const user = await db.getSessionUser(parseCookies(req).sid || '')
   res.json({ user: user || null })
@@ -384,8 +394,11 @@ app.use((error, req, res, next) => {
   console.error(error)
   if (res.headersSent) return next(error)
   const message = String(error.message || '')
-  const publico = message.includes('Firebase') ? message : 'Erro interno. Tente de novo.'
-  res.status(500).json({ error: publico })
+  let publico = 'Erro interno. Tente de novo.'
+  if (/Firebase|credential|FIREBASE|PERMISSION|UNAUTHENTICATED|service account/i.test(message)) {
+    publico = 'O Firebase não conectou. Confira as variáveis na Vercel.'
+  }
+  res.status(500).json({ error: publico, detalhe: message })
 })
 
 export async function boot() {
